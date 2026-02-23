@@ -42,7 +42,7 @@ use crate::validation::{OpoutsDagInfo, Scripts};
 use crate::vm::{ContractStateAccess, ContractStateEvolve, OrdOpRef, WitnessOrd};
 use crate::{
     AssignmentType, Assignments, BundleId, ChainNet, ContractId, KnownTransition, OpId, Operation,
-    Opout, RevealedState, SchemaId, TransitionBundle,
+    Opout, RevealedState, SchemaId, Transition, TransitionBundle,
 };
 
 /// Error validating a consignment.
@@ -189,6 +189,8 @@ pub struct Validator<
 
     opout_assigns: RefCell<BTreeMap<Opout, RevealedAssign>>,
 
+    claim_nullifiers: RefCell<HashMap<Vec<u8>, OpId>>,
+
     // Operations in this set will not be validated
     resolver: CheckedWitnessResolver<&'resolver R>,
     safe_height: Option<NonZeroU32>,
@@ -227,6 +229,8 @@ impl<
 
         let opout_assigns = RefCell::new(BTreeMap::<Opout, RevealedAssign>::new());
 
+        let claim_nullifiers = RefCell::new(HashMap::<Vec<u8>, OpId>::new());
+
         let mut opouts_dag_info = None;
         if validation_config.build_opouts_dag {
             opouts_dag_info = Some(RefCell::new(OpoutsDagInfo::new()));
@@ -241,6 +245,7 @@ impl<
             scripts,
             input_opouts,
             opout_assigns,
+            claim_nullifiers,
             resolver: CheckedWitnessResolver::from(resolver),
             contract_state: Rc::new(RefCell::new(S::init(context))),
             safe_height: validation_config.safe_height,
@@ -426,6 +431,171 @@ impl<
         }
     }
 
+    fn schema_meta_type_by_name(&self, name: &str) -> Option<crate::schema::MetaType> {
+        self.consignment
+            .schema()
+            .meta_types
+            .iter()
+            .find_map(|(meta_type, details)| {
+                (details.name.to_string() == name).then_some(*meta_type)
+            })
+    }
+
+    fn schema_global_type_by_name(&self, name: &str) -> Option<crate::schema::GlobalStateType> {
+        self.consignment
+            .schema()
+            .global_types
+            .iter()
+            .find_map(|(global_type, details)| {
+                (details.name.to_string() == name).then_some(*global_type)
+            })
+    }
+
+    fn claim_meta_bytes(
+        &self,
+        transition: &Transition,
+        opid: OpId,
+        meta_name: &str,
+    ) -> Result<Vec<u8>, ValidationError> {
+        let Some(meta_type) = self.schema_meta_type_by_name(meta_name) else {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeMissingField(
+                opid,
+                meta_name.to_owned(),
+            )));
+        };
+        let Some(value) = transition.metadata.get(&meta_type) else {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeMissingField(
+                opid,
+                meta_name.to_owned(),
+            )));
+        };
+        Ok(value.as_slice().to_vec())
+    }
+
+    fn claim_genesis_global_bytes(
+        &self,
+        opid: OpId,
+        global_name: &str,
+    ) -> Result<Vec<u8>, ValidationError> {
+        let Some(global_type) = self.schema_global_type_by_name(global_name) else {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeMissingField(
+                opid,
+                global_name.to_owned(),
+            )));
+        };
+        let Some(values) = self.consignment.genesis().globals.get(&global_type) else {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeMissingField(
+                opid,
+                global_name.to_owned(),
+            )));
+        };
+        let Some(value) = values.first() else {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeMissingField(
+                opid,
+                global_name.to_owned(),
+            )));
+        };
+        Ok(value.as_slice().to_vec())
+    }
+
+    fn claim_transition_global_bytes(
+        &self,
+        transition: &Transition,
+        opid: OpId,
+        global_name: &str,
+    ) -> Result<Vec<u8>, ValidationError> {
+        let Some(global_type) = self.schema_global_type_by_name(global_name) else {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeMissingField(
+                opid,
+                global_name.to_owned(),
+            )));
+        };
+        let Some(values) = transition.globals.get(&global_type) else {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeMissingField(
+                opid,
+                global_name.to_owned(),
+            )));
+        };
+        let Some(value) = values.first() else {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeMissingField(
+                opid,
+                global_name.to_owned(),
+            )));
+        };
+        Ok(value.as_slice().to_vec())
+    }
+
+    fn validate_claim_mint_consensus(
+        &self,
+        transition: &Transition,
+        opid: OpId,
+    ) -> Result<(), ValidationError> {
+        let Some(transition_details) = self
+            .consignment
+            .schema()
+            .transitions
+            .get(&transition.transition_type)
+        else {
+            return Ok(());
+        };
+        if transition_details.name.to_string() != "claimMint" {
+            return Ok(());
+        }
+
+        let required_meta = [
+            "claimAmount",
+            "claimChainId",
+            "claimContract",
+            "claimEventLogIndex",
+            "claimEventTxHash",
+            "claimNullifier",
+            "claimProof",
+        ];
+        for meta_name in required_meta {
+            let _ = self.claim_meta_bytes(transition, opid, meta_name)?;
+        }
+
+        let claim_amount = self.claim_meta_bytes(transition, opid, "claimAmount")?;
+        let issued_supply = self.claim_transition_global_bytes(transition, opid, "issuedSupply")?;
+        if claim_amount != issued_supply {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeBindingMismatch(
+                opid,
+                "claimAmount".to_owned(),
+                "issuedSupply".to_owned(),
+            )));
+        }
+
+        let claim_chain_id = self.claim_meta_bytes(transition, opid, "claimChainId")?;
+        let evm_chain_id = self.claim_genesis_global_bytes(opid, "evmChainId")?;
+        if claim_chain_id != evm_chain_id {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeBindingMismatch(
+                opid,
+                "claimChainId".to_owned(),
+                "evmChainId".to_owned(),
+            )));
+        }
+
+        let claim_contract = self.claim_meta_bytes(transition, opid, "claimContract")?;
+        let evm_contract = self.claim_genesis_global_bytes(opid, "evmClaimMintContract")?;
+        if claim_contract != evm_contract {
+            return Err(ValidationError::InvalidConsignment(Failure::BridgeBindingMismatch(
+                opid,
+                "claimContract".to_owned(),
+                "evmClaimMintContract".to_owned(),
+            )));
+        }
+
+        let nullifier = self.claim_meta_bytes(transition, opid, "claimNullifier")?;
+        if let Some(existing) = self.claim_nullifiers.borrow_mut().insert(nullifier, opid) {
+            if existing != opid {
+                return Err(ValidationError::InvalidConsignment(
+                    Failure::BridgeNullifierDuplicate(opid, existing),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Single-use-seal closing validation.
     ///
     /// Checks that the set of seals is closed over the message, which is
@@ -519,6 +689,7 @@ impl<
                 transition.contract_id(),
             )));
         }
+        self.validate_claim_mint_consensus(transition, opid)?;
         let bundle_id = bundle.bundle_id();
 
         let mut state_by_type = BTreeMap::<AssignmentType, Vec<RevealedState>>::new();

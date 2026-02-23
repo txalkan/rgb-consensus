@@ -259,6 +259,13 @@ pub enum Failure {
     /// Custom error by external services on top of RGB Consensus.
     #[display(inner)]
     Custom(String),
+
+    /// Bridge operation {0} misses required field `{1}`.
+    BridgeMissingField(OpId, String),
+    /// Bridge operation {0} has inconsistent field `{1}` (expected `{2}` binding).
+    BridgeBindingMismatch(OpId, String, String),
+    /// Bridge operation {0} reuses nullifier already seen in operation {1}.
+    BridgeNullifierDuplicate(OpId, OpId),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Display, From)]
